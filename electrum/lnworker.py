@@ -59,11 +59,12 @@ from .lnutil import (Outpoint, LNPeerAddr,
                      ShortChannelID, PaymentAttemptLog, PaymentAttemptFailureDetails,
                      BarePaymentAttemptLog, derive_payment_secret_from_payment_preimage)
 from .lnutil import ln_dummy_address, ln_compare_features, IncompatibleLightningFeatures
+from .lnrouter import TrampolineEdge
 from .transaction import PartialTxOutput, PartialTransaction, PartialTxInput
 from .lnonion import OnionFailureCode, process_onion_packet, OnionPacket, OnionRoutingFailureMessage
 from .lnmsg import decode_msg
 from .i18n import _
-from .lnrouter import (RouteEdge, LNPaymentRoute, LNPaymentPath, is_route_sane_to_use,
+from .lnrouter import (PathEdge, RouteEdge, LNPaymentRoute, LNPaymentPath, is_route_sane_to_use,
                        NoChannelPolicy, LNPathInconsistent)
 from .address_synchronizer import TX_HEIGHT_LOCAL
 from . import lnsweep
@@ -74,6 +75,7 @@ from .lnchannel import ChannelBackup
 from .channel_db import UpdateStatus
 from .channel_db import get_mychannel_info, get_mychannel_policy
 from .submarine_swaps import SwapManager
+from .channel_db import ChannelInfo, Policy
 
 if TYPE_CHECKING:
     from .network import Network
@@ -134,6 +136,53 @@ FALLBACK_NODE_LIST_MAINNET = [
 ]
 
 
+# hardcoded list
+TRAMPOLINE_NODES = [
+    LNPeerAddr(host='34.239.230.56', port=9735, pubkey=bfh('03864ef025fde8fb587d989186ce6a4a186895ee44a926bfc370e2c366597a3f8f')),  # ACINQ
+    LNPeerAddr(host='144.76.99.209', port=9740, pubkey=bfh('03ecef675be448b615e6176424070673ef8284e0fd19d8be062a6cb5b130a0a0d1')),  # Electrum trampoline
+]
+
+
+# trampoline nodes are supposed to advertise their fee and cltv in node_update message
+TRAMPOLINE_FEES = [
+    {
+        'fee_base_msat': 0,
+        'fee_proportional_millionths': 0,
+        'cltv_expiry_delta': 576,
+    },
+    {
+        'fee_base_msat': 1000,
+        'fee_proportional_millionths': 100,
+        'cltv_expiry_delta': 576,
+    },
+    {
+        'fee_base_msat': 3000,
+        'fee_proportional_millionths': 100,
+        'cltv_expiry_delta': 576,
+    },
+    {
+        'fee_base_msat': 5000,
+        'fee_proportional_millionths': 500,
+        'cltv_expiry_delta': 576,
+    },
+    {
+        'fee_base_msat': 7000,
+        'fee_proportional_millionths': 1000,
+        'cltv_expiry_delta': 576,
+    },
+    {
+        'fee_base_msat': 12000,
+        'fee_proportional_millionths': 3000,
+        'cltv_expiry_delta': 576,
+    },
+    {
+        'fee_base_msat': 100000,
+        'fee_proportional_millionths': 3000,
+        'cltv_expiry_delta': 576,
+    },
+]
+
+
 class PaymentInfo(NamedTuple):
     payment_hash: bytes
     amount: Optional[int]  # in satoshis  # TODO make it msat and rename to amount_msat
@@ -172,6 +221,7 @@ class LNWorker(Logger, NetworkRetryManager[LNPeerAddr]):
         self.features |= LnFeatures.OPTION_STATIC_REMOTEKEY_OPT
         self.features |= LnFeatures.VAR_ONION_OPT
         self.features |= LnFeatures.PAYMENT_SECRET_OPT
+        self.features |= LnFeatures.OPTION_TRAMPOLINE_ROUTING_OPT
 
         util.register_callback(self.on_proxy_changed, ['proxy_set'])
 
@@ -311,6 +361,9 @@ class LNWorker(Logger, NetworkRetryManager[LNPeerAddr]):
                 chan.add_or_update_peer_addr(peer_addr)
 
     async def _get_next_peers_to_try(self) -> Sequence[LNPeerAddr]:
+        if not self.channel_db:
+            return TRAMPOLINE_NODES
+        #
         now = time.time()
         await self.channel_db.data_loaded.wait()
         # first try from recent peers
@@ -612,6 +665,7 @@ class LNWallet(LNWorker):
                 self.reestablish_peers_and_channels(),
                 self.sync_with_local_watchtower(),
                 self.sync_with_remote_watchtower(),
+                self._maintain_connectivity(),
         ]:
             tg_coro = self.taskgroup.spawn(coro)
             asyncio.run_coroutine_threadsafe(tg_coro, self.network.asyncio_loop)
@@ -910,13 +964,17 @@ class LNWallet(LNWorker):
         self.logs[key] = log = []
         success = False
         reason = ''
+        #attempts = 1
         for i in range(attempts):
             try:
                 # note: path-finding runs in a separate thread so that we don't block the asyncio loop
                 # graph updates might occur during the computation
                 self.set_invoice_status(key, PR_ROUTING)
                 util.trigger_callback('invoice_status', self.wallet, key)
-                route = await run_in_thread(partial(self._create_route_from_invoice, lnaddr, full_path=full_path))
+                if self.channel_db:
+                    route = await run_in_thread(partial(self._create_route_from_invoice, lnaddr, full_path=full_path))
+                else:
+                    route = self.create_trampoline_route(lnaddr, i)
                 self.set_invoice_status(key, PR_INFLIGHT)
                 util.trigger_callback('invoice_status', self.wallet, key)
                 payment_attempt_log = await self._pay_to_route(route, lnaddr)
@@ -961,7 +1019,7 @@ class LNWallet(LNWorker):
                 # TODO "decode_onion_error" might raise, catch and maybe blacklist/penalise someone?
                 failure_msg, sender_idx = chan.decode_onion_error(payment_attempt.error_bytes, route, htlc.htlc_id)
                 is_blacklisted = self.handle_error_code_from_failed_htlc(failure_msg, sender_idx, route, peer)
-                if is_blacklisted:
+                if self.channel_db and is_blacklisted:
                     # blacklist channel after reporter node
                     # TODO this should depend on the error (even more granularity)
                     # also, we need finer blacklisting (directed edges; nodes)
@@ -997,6 +1055,7 @@ class LNWallet(LNWorker):
             OnionFailureCode.INCORRECT_CLTV_EXPIRY: 4,
             OnionFailureCode.EXPIRY_TOO_SOON: 0,
             OnionFailureCode.CHANNEL_DISABLED: 2,
+            OnionFailureCode.TRAMPOLINE_FEE_INSUFFICIENT: 0,
         }
         if code in failure_codes:
             offset = failure_codes[code]
@@ -1004,11 +1063,14 @@ class LNWallet(LNWorker):
             channel_update_as_received = data[offset+2: offset+2+channel_update_len]
             payload = self._decode_channel_update_msg(channel_update_as_received)
             if payload is None:
-                self.logger.info(f'could not decode channel_update for failed htlc: {channel_update_as_received.hex()}')
+                self.logger.info(f'could not decode channel_update for failed htlc: {channel_update_len}  {data.hex()}')
                 return True
+            if not self.channel_db:
+                self.logger.info(f'payload {payload}')
+                return False
+            short_channel_id = ShortChannelID(payload['short_channel_id'])
             r = self.channel_db.add_channel_update(payload)
             blacklist = False
-            short_channel_id = ShortChannelID(payload['short_channel_id'])
             if r == UpdateStatus.GOOD:
                 self.logger.info(f"applied channel update to {short_channel_id}")
                 peer.maybe_save_remote_update(payload)
@@ -1065,6 +1127,91 @@ class LNWallet(LNWorker):
                 _("Invoice wants us to risk locking funds for unreasonably long."),
                 f"min_final_cltv_expiry: {addr.get_min_final_cltv_expiry()}"))
         return addr
+
+    def encode_routing_info(self, decoded_invoice):
+        import bitstring
+        # only want 'r' tags
+        r_tags = list(filter(lambda x: x[0] == 'r', decoded_invoice.tags))
+        # strip the tag type, it's implicitly 'r' now
+        r_tags = list(map(lambda x: x[1], r_tags))
+        result = bitstring.BitArray()
+        for route in r_tags:
+            result.append(bitstring.pack('uint:8', len(route)))
+            for step in route:
+                pubkey, channel, feebase, feerate, cltv = step
+                result.append(bitstring.BitArray(pubkey) + bitstring.BitArray(channel) + bitstring.pack('intbe:32', feebase) + bitstring.pack('intbe:32', feerate) + bitstring.pack('intbe:16', cltv))
+        return result.tobytes()
+
+    def suggest_peer(self):
+        return self.lnrater.suggest_peer() if self.channel_db else TRAMPOLINE_NODES[0].pubkey
+
+    def create_trampoline_route(self, decoded_invoice: 'LnAddr', attempt:int) -> LNPaymentRoute:
+        """ return the route that leads to trampoline, and the trampoline fake edge"""
+
+        amount_msat = decoded_invoice.get_amount_msat()
+        invoice_pubkey = decoded_invoice.pubkey.serialize()
+        invoice_features = decoded_invoice.get_tag('9') or 0
+        is_legacy = not bool(invoice_features & LnFeatures.OPTION_TRAMPOLINE_ROUTING_OPT)
+        invoice_routing_info = self.encode_routing_info(decoded_invoice)
+        if attempt >= len(TRAMPOLINE_FEES):
+            raise NoPathFound()
+        trampoline_addr = TRAMPOLINE_NODES[0]
+        trampoline_node_id = trampoline_addr.pubkey
+        params = TRAMPOLINE_FEES[attempt]
+        self.logger.info(f'create_trampoline_route: attempt={attempt}, is legacy: {is_legacy}')
+        channels = self.channels_for_peer(trampoline_node_id)
+        if not channels:
+            return
+        for chan in channels.values():
+            trampoline_short_channel_id = chan.short_channel_id
+            break
+        # assume direct channel to trampoline
+        trampoline_features = self._peers[trampoline_node_id].features
+        # hop to trampoline
+        route = [
+            RouteEdge(
+                node_id=trampoline_node_id,
+                short_channel_id=trampoline_short_channel_id,
+                fee_base_msat=0,
+                fee_proportional_millionths=0,
+                cltv_expiry_delta=0,
+                node_features=trampoline_features)
+        ]
+        # trampoline hop
+        route.append(
+            TrampolineEdge(
+                node_id=trampoline_node_id,
+                short_channel_id=0,
+                fee_base_msat=params['fee_base_msat'],
+                fee_proportional_millionths=params['fee_proportional_millionths'],
+                cltv_expiry_delta=params['cltv_expiry_delta'],
+                node_features=trampoline_features,
+                outgoing_node_id = invoice_pubkey,
+                invoice_routing_info = invoice_routing_info,
+                invoice_features = invoice_features if is_legacy else None)
+        )
+        # trampoline onion for recipient. (legacy recipients need an onion)
+        route.append(
+            RouteEdge(
+                node_id=invoice_pubkey,
+                short_channel_id=0,
+                fee_base_msat=0,
+                fee_proportional_millionths=0,
+                cltv_expiry_delta=0,
+                node_features=invoice_features)
+            if is_legacy else
+            TrampolineEdge(
+                node_id=invoice_pubkey,
+                short_channel_id=0,
+                fee_base_msat=0,
+                fee_proportional_millionths=0,
+                cltv_expiry_delta=0,
+                node_features=invoice_features,
+                outgoing_node_id = None,
+                invoice_routing_info = None,
+                invoice_features = None)
+        )
+        return route
 
     @profiler
     def _create_route_from_invoice(self, decoded_invoice: 'LnAddr',
@@ -1422,6 +1569,8 @@ class LNWallet(LNWorker):
     @ignore_exceptions
     @log_exceptions
     async def reestablish_peer_for_given_channel(self, chan: Channel) -> None:
+        if not self.channel_db:
+            return
         now = time.time()
         peer_addresses = []
         # will try last good address first, from gossip
