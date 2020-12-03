@@ -269,7 +269,7 @@ class PasswordDialog(AbstractPasswordDialog):
 
     def __init__(self, app, **kwargs):
         AbstractPasswordDialog.__init__(self, app, **kwargs)
-        self.hide_wallet_label = app.electrum_config.get('use_single_password')
+        self.hide_wallet_label = bool(app.electrum_config.get('use_single_password'))
 
     def clear_password(self):
         self.ids.textinput_generic_password.text = ''
