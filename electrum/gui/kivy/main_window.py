@@ -649,6 +649,10 @@ class ElectrumWindow(App, Logger):
             return
         if self.wallet and self.wallet.storage.path == path:
             return
+        if self.password and self.electrum_config.get('use_single_password'):
+            storage = WalletStorage(path)
+            storage.check_password(self.password)
+            self.on_open_wallet(self.password, storage)
         else:
             def launch_wizard():
                 d = OpenWalletDialog(self, path, self.on_open_wallet)
